@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
 Resume & Cover Letter Bot for Vasu Sood
-Tailors resume and generates cover letter based on a job description.
+Paste a LinkedIn/Indeed job URL OR raw job description text.
+Claude fetches the URL, extracts job details, then tailors your resume + cover letter.
+
 Usage: python resume_bot.py
 """
 
 import anthropic
 import sys
 import os
-from pathlib import Path
+import json
+import re
 
 # ──────────────────────────────────────────────
 # BASE RESUME DATA
@@ -85,15 +88,120 @@ Guidelines:
 """
 
 
-def get_job_description() -> str:
-    """Get job description from user (multi-line input)."""
+def is_url(text: str) -> bool:
+    """Check if the input looks like a URL."""
+    text = text.strip()
+    return bool(re.match(r'^https?://', text, re.IGNORECASE))
+
+
+def fetch_job_from_url(url: str, client: anthropic.Anthropic) -> dict:
+    """
+    Use Claude's web_fetch tool to fetch the job page and extract:
+    - company name
+    - role title
+    - full job description
+    """
+    print(f"\n  Fetching job details from URL...")
+
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                f"Please fetch this job posting URL and extract the following information:\n"
+                f"URL: {url}\n\n"
+                f"Extract and return ONLY a JSON object with these fields:\n"
+                f'{{"company": "...", "role": "...", "job_description": "...full description..."}}\n\n'
+                f"The job_description should include: role summary, responsibilities, requirements, "
+                f"qualifications, and any other relevant details from the posting. Be thorough."
+            ),
+        }
+    ]
+
+    tools = [{"type": "web_fetch_20260209", "name": "web_fetch"}]
+
+    # Agentic loop — Claude fetches the URL and returns structured data
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=4000,
+            tools=tools,
+            messages=messages,
+        )
+
+        # Append assistant response to history
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "end_turn":
+            break
+
+        if response.stop_reason == "pause_turn":
+            # Server-side tool hit iteration limit — continue
+            continue
+
+        # Handle tool results
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                # web_fetch is server-side — result comes back automatically
+                # We just need to pass an empty result to continue
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": "",
+                })
+
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+
+    # Extract the JSON from Claude's final text response
+    final_text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            final_text += block.text
+
+    # Try to parse JSON from response
+    json_match = re.search(r'\{.*\}', final_text, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group())
+            return {
+                "company": data.get("company", "Unknown Company"),
+                "role": data.get("role", "Unknown Role"),
+                "job_description": data.get("job_description", final_text),
+            }
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: return raw text as job description
+    return {
+        "company": "Unknown Company",
+        "role": "Unknown Role",
+        "job_description": final_text,
+    }
+
+
+def get_input() -> tuple[str, str, str]:
+    """
+    Get input from user — either a URL or pasted job description.
+    Returns (company, role, job_description).
+    """
     print("\n" + "="*60)
     print("  RESUME & COVER LETTER BOT — Powered by Claude")
     print("="*60)
-    print("\nPaste the job description below.")
-    print("When done, press Enter twice (blank line) to submit:\n")
+    print()
+    print("Paste a LinkedIn/Indeed job URL  →  bot fetches it automatically")
+    print("OR paste the job description text (press Enter twice when done)")
+    print()
+    print("Input: ", end="", flush=True)
 
-    lines = []
+    first_line = input().strip()
+
+    if is_url(first_line):
+        return first_line, None, None  # Signal to fetch URL
+
+    # Multi-line text input
+    print("(paste remaining lines, press Enter twice to finish)")
+    lines = [first_line]
     consecutive_blanks = 0
     while True:
         try:
@@ -109,26 +217,23 @@ def get_job_description() -> str:
         except EOFError:
             break
 
-    return "\n".join(lines).strip()
+    job_text = "\n".join(lines).strip()
 
-
-def get_company_info() -> tuple[str, str]:
-    """Get company name and role title."""
     print("\nCompany name (e.g. Glencore, Trafigura, UBS): ", end="")
     company = input().strip() or "the company"
     print("Role title (e.g. Commodity Trader, Market Analyst): ", end="")
     role = input().strip() or "the role"
-    return company, role
+
+    return None, company, role, job_text  # type: ignore
 
 
 def generate_tailored_resume_and_cover_letter(
     job_description: str,
     company: str,
     role: str,
+    client: anthropic.Anthropic,
 ) -> None:
     """Call Claude to tailor resume and generate cover letter."""
-    client = anthropic.Anthropic()
-
     user_prompt = f"""
 Company: {company}
 Role: {role}
@@ -157,7 +262,7 @@ Write a professional cover letter for Vasu Sood applying to {company} for the {r
 - Opening: Hook with the most impressive relevant achievement
 - Para 2: Why this specific company and role excites him
 - Para 3: What he brings (top 2-3 relevant skills/experiences)
-- Closing: Call to action, open to relocation/visa sponsorship
+- Closing: Call to action, mention open to relocation and visa sponsorship
 - Tone: Confident, professional, not sycophantic
 - Length: ~250-300 words
 """
@@ -166,13 +271,15 @@ Write a professional cover letter for Vasu Sood applying to {company} for the {r
     print(f"  Generating tailored resume + cover letter for {company}...")
     print("="*60 + "\n")
 
-    output_file = f"output_{company.replace(' ', '_').lower()}_{role.replace(' ', '_').lower()}.txt"
+    safe_company = re.sub(r'[^\w]', '_', company.lower())[:30]
+    safe_role = re.sub(r'[^\w]', '_', role.lower())[:30]
+    output_file = f"output_{safe_company}_{safe_role}.txt"
 
     with open(output_file, "w") as f:
         f.write(f"TAILORED APPLICATION: {role} at {company}\n")
         f.write("="*60 + "\n\n")
 
-    # Stream the response
+    full_response = ""
     with client.messages.stream(
         model="claude-opus-4-6",
         max_tokens=4000,
@@ -180,12 +287,10 @@ Write a professional cover letter for Vasu Sood applying to {company} for the {r
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     ) as stream:
-        full_response = ""
         for text in stream.text_stream:
             print(text, end="", flush=True)
             full_response += text
 
-    # Save to file
     with open(output_file, "a") as f:
         f.write(full_response)
 
@@ -195,21 +300,41 @@ Write a professional cover letter for Vasu Sood applying to {company} for the {r
 
 
 def main():
-    # Check API key
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ERROR: ANTHROPIC_API_KEY environment variable not set.")
         print("Get your key at: https://console.anthropic.com/")
         print("Then run: export ANTHROPIC_API_KEY='your-key-here'")
         sys.exit(1)
 
-    company, role = get_company_info()
-    job_description = get_job_description()
+    client = anthropic.Anthropic()
+
+    result = get_input()
+
+    # URL mode
+    if result[0] is not None:
+        url = result[0]
+        job_data = fetch_job_from_url(url, client)
+        company = job_data["company"]
+        role = job_data["role"]
+        job_description = job_data["job_description"]
+
+        print(f"\n  Detected: {role} at {company}")
+        print("  Press Enter to confirm, or type a correction: ", end="")
+        correction = input().strip()
+        if correction:
+            # Allow overriding company/role if extraction was wrong
+            parts = correction.split(" at ", 1)
+            if len(parts) == 2:
+                role, company = parts[0].strip(), parts[1].strip()
+    else:
+        # Text mode
+        _, company, role, job_description = result
 
     if not job_description:
-        print("No job description provided. Exiting.")
+        print("Could not extract job description. Exiting.")
         sys.exit(1)
 
-    generate_tailored_resume_and_cover_letter(job_description, company, role)
+    generate_tailored_resume_and_cover_letter(job_description, company, role, client)
 
 
 if __name__ == "__main__":
